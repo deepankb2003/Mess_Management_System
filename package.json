@@ -1,0 +1,8 @@
+{
+  "name": "iiit-mess-management",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Campus mess management: menu, meal skips, monthly billing, simulated Pay Now, feedback, staff panel",
+  "engines": { "node": ">=22.13" },
+  "scripts": { "start": "node server.js", "dev": "node --watch server.js" }
+}
