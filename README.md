@@ -1,6 +1,6 @@
 # IIIT Bhubaneswar Mess Management System
 
-Full-stack JavaScript app: Node.js backend + SQLite + plain HTML/CSS/JS frontend. **No npm dependencies, no Python.**
+Full-stack JavaScript app: Node.js backend + SQLite + plain HTML/CSS/JS frontend.
 
 ## Run
 Requires Node.js 22.13 or later.
