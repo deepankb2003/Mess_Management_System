@@ -39,13 +39,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS menu (
   weekday INTEGER NOT NULL, meal TEXT NOT NULL, items TEXT NOT NULL, PRIMARY KEY (weekday, meal));
-CREATE TABLE IF NOT EXISTS skips (
+CREATE TABLE IF NOT EXISTS selections (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   date TEXT NOT NULL, meal TEXT NOT NULL, PRIMARY KEY (user_id, date, meal));
-CREATE TABLE IF NOT EXISTS payments (
+CREATE TABLE IF NOT EXISTS week_payments (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  month TEXT NOT NULL, amount INTEGER NOT NULL, method TEXT NOT NULL,
-  paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, month));
+  week_start TEXT NOT NULL, amount INTEGER NOT NULL, method TEXT NOT NULL,
+  paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, week_start));
 CREATE TABLE IF NOT EXISTS feedback (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   date TEXT NOT NULL, meal TEXT NOT NULL, rating INTEGER NOT NULL, comment TEXT NOT NULL DEFAULT '',
@@ -98,25 +98,31 @@ function cleanup() {
 cleanup();
 setInterval(cleanup, 36e5).unref();
 
-// ---------- billing ----------
-function bill(uid, month) {
-  const [y, m] = month.split('-').map(Number);
-  const days = new Date(y, m, 0).getDate();
-  const gross = days * MEALS.reduce((s, k) => s + PRICE[k], 0);
-  let skipped = 0, savings = 0;
-  for (const r of db.prepare('SELECT meal, COUNT(*) AS c FROM skips WHERE user_id = ? AND date LIKE ? GROUP BY meal').all(uid, month + '-%')) {
-    skipped += r.c; savings += r.c * (PRICE[r.meal] || 0);
-  }
-  const pay = db.prepare('SELECT amount, paid_at, method FROM payments WHERE user_id = ? AND month = ?').get(uid, month);
-  const net = gross - savings;
-  return { month, days, gross, skipped, savings, net, paid: !!pay, paid_amount: pay ? pay.amount : 0, paid_at: pay ? pay.paid_at : null, method: pay ? pay.method : null, due: pay ? 0 : net };
+// ---------- weekly billing: students tick the meals they will eat and pay for exactly those ----------
+const addDays = (str, n) => { const d = new Date(str + 'T00:00:00'); d.setDate(d.getDate() + n); return ymd(d); };
+const mondayOf = (str) => { const d = new Date(str + 'T00:00:00'); d.setDate(d.getDate() - ((d.getDay() + 6) % 7)); return ymd(d); };
+const isWeekStart = (str) => isDate(str) && mondayOf(str) === str;
+
+function weekSummary(uid, start) {
+  const rows = db.prepare('SELECT date, meal FROM selections WHERE user_id = ? AND date BETWEEN ? AND ?').all(uid, start, addDays(start, 6));
+  const byDate = {};
+  let total = 0;
+  for (const r of rows) { (byDate[r.date] ||= []).push(r.meal); total += PRICE[r.meal] || 0; }
+  const days = Array.from({ length: 7 }, (_, i) => {
+    const date = addDays(start, i), meals = byDate[date] || [];
+    return { date, meals, subtotal: meals.reduce((t, m) => t + (PRICE[m] || 0), 0) };
+  });
+  const pay = db.prepare('SELECT amount, method, paid_at FROM week_payments WHERE user_id = ? AND week_start = ?').get(uid, start);
+  return { start, end: addDays(start, 6), days, count: rows.length, total, paid: !!pay, paid_amount: pay ? pay.amount : 0, method: pay ? pay.method : null, paid_at: pay ? pay.paid_at : null, due: pay ? 0 : total };
 }
-function settle(uid, month, method) {
-  if (month > ymd(new Date()).slice(0, 7)) fail(400, 'You cannot pay for a future month');
-  const b = bill(uid, month);
-  if (b.paid) fail(409, 'This month is already paid');
-  db.prepare('INSERT INTO payments (user_id, month, amount, method) VALUES (?, ?, ?, ?)').run(uid, month, b.net, method);
-  return bill(uid, month);
+const weekPaid = (uid, start) => !!db.prepare('SELECT 1 FROM week_payments WHERE user_id = ? AND week_start = ?').get(uid, start);
+
+function settle(uid, start, method) {
+  const w = weekSummary(uid, start);
+  if (w.paid) fail(409, 'This week is already paid');
+  if (w.total <= 0) fail(400, 'Tick at least one meal before paying');
+  db.prepare('INSERT INTO week_payments (user_id, week_start, amount, method) VALUES (?, ?, ?, ?)').run(uid, start, w.total, method);
+  return weekSummary(uid, start);
 }
 
 // ---------- tiny router ----------
@@ -181,37 +187,57 @@ route('PUT', '/api/menu', 'staff', ({ body }) => {
   return { ok: true };
 });
 
-route('GET', '/api/skips', 'student', ({ user, query }) => {
-  if (!isDate(query.from) || !isDate(query.to)) fail(400, 'from/to must be YYYY-MM-DD');
-  return { skips: db.prepare('SELECT date, meal FROM skips WHERE user_id = ? AND date BETWEEN ? AND ?').all(user.id, query.from, query.to) };
+route('GET', '/api/week', 'student', ({ user, query }) => {
+  if (!isWeekStart(query.start)) fail(400, 'start must be a Monday (YYYY-MM-DD)');
+  return weekSummary(user.id, query.start);
 });
 
-route('POST', '/api/skips', 'student', ({ user, body }) => {
-  const { date, meal, skip } = body;
+function editableDate(uid, date) {
+  const today = ymd(new Date());
+  if (date < today) fail(400, 'Past days cannot be changed');
+  if (date > addDays(today, 28)) fail(400, 'You can only plan up to 4 weeks ahead');
+  if (weekPaid(uid, mondayOf(date))) fail(409, 'That week is already paid and locked');
+}
+
+route('POST', '/api/select', 'student', ({ user, body }) => {
+  const { date, meal, on } = body;
   if (!isDate(date) || !MEALS.includes(meal)) fail(400, 'Invalid date or meal');
-  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
-  const limit = new Date(); limit.setDate(limit.getDate() + 45);
-  if (date < ymd(tomorrow)) fail(400, 'Meals can only be skipped from tomorrow onwards');
-  if (date > ymd(limit)) fail(400, 'You can only plan up to 45 days ahead');
-  if (bill(user.id, date.slice(0, 7)).paid) fail(409, 'That month is already paid and locked');
-  if (skip) db.prepare('INSERT OR IGNORE INTO skips (user_id, date, meal) VALUES (?, ?, ?)').run(user.id, date, meal);
-  else db.prepare('DELETE FROM skips WHERE user_id = ? AND date = ? AND meal = ?').run(user.id, date, meal);
-  return { ok: true };
+  editableDate(user.id, date);
+  if (on) db.prepare('INSERT OR IGNORE INTO selections (user_id, date, meal) VALUES (?, ?, ?)').run(user.id, date, meal);
+  else db.prepare('DELETE FROM selections WHERE user_id = ? AND date = ? AND meal = ?').run(user.id, date, meal);
+  return weekSummary(user.id, mondayOf(date));
 });
 
-route('GET', '/api/bill', 'student', ({ user, query }) => {
-  if (!isMonth(query.month)) fail(400, 'month must be YYYY-MM');
-  return bill(user.id, query.month);
+route('POST', '/api/select-week', 'student', ({ user, body }) => {
+  if (!isWeekStart(body.start)) fail(400, 'start must be a Monday');
+  if (weekPaid(user.id, body.start)) fail(409, 'That week is already paid and locked');
+  const today = ymd(new Date()), limit = addDays(today, 28);
+  db.exec('BEGIN');
+  try {
+    for (let i = 0; i < 7; i++) {
+      const date = addDays(body.start, i);
+      if (date < today || date > limit) continue;
+      for (const meal of MEALS) {
+        if (body.on) db.prepare('INSERT OR IGNORE INTO selections (user_id, date, meal) VALUES (?, ?, ?)').run(user.id, date, meal);
+        else db.prepare('DELETE FROM selections WHERE user_id = ? AND date = ? AND meal = ?').run(user.id, date, meal);
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+  return weekSummary(user.id, body.start);
 });
 
-// Simulated payment: "Pay Now" immediately records the month as paid.
+// Simulated payment: cash or an online method; either immediately records the week as paid.
+const PAY_METHODS = { Cash: 'Cash', UPI: 'Online (UPI)', Card: 'Online (Card)', 'Net Banking': 'Online (Net Banking)' };
 route('POST', '/api/pay', 'student', ({ user, body }) => {
-  if (!isMonth(body.month)) fail(400, 'month must be YYYY-MM');
-  return settle(user.id, body.month, 'Pay Now');
+  if (!isWeekStart(body.start)) fail(400, 'start must be a Monday');
+  const label = Object.hasOwn(PAY_METHODS, body.method) ? PAY_METHODS[body.method] : null;
+  if (!label) fail(400, 'Choose a payment method');
+  return settle(user.id, body.start, label);
 });
 
 route('GET', '/api/payments', 'student', ({ user }) => ({
-  payments: db.prepare('SELECT month, amount, method, paid_at FROM payments WHERE user_id = ? ORDER BY month DESC').all(user.id),
+  payments: db.prepare('SELECT week_start, amount, method, paid_at FROM week_payments WHERE user_id = ? ORDER BY week_start DESC LIMIT 30').all(user.id),
 }));
 
 route('POST', '/api/feedback', 'student', ({ user, body }) => {
@@ -230,24 +256,29 @@ route('GET', '/api/staff/feedback', 'staff', () => ({
 }));
 
 route('GET', '/api/staff/overview', 'staff', ({ query }) => {
-  if (!isMonth(query.month)) fail(400, 'month must be YYYY-MM');
-  const students = db.prepare("SELECT id, roll, name FROM users WHERE role = 'student' ORDER BY roll").all().map((u) => ({ ...u, ...bill(u.id, query.month) }));
+  if (!isWeekStart(query.start)) fail(400, 'start must be a Monday (YYYY-MM-DD)');
+  const students = db.prepare("SELECT id, roll, name FROM users WHERE role = 'student' ORDER BY roll").all().map((u) => {
+    const w = weekSummary(u.id, query.start);
+    return { ...u, count: w.count, total: w.total, paid: w.paid, paid_amount: w.paid_amount, due: w.due, method: w.method };
+  });
+  const demand = {};
+  for (const r of db.prepare('SELECT date, meal, COUNT(*) AS c FROM selections WHERE date BETWEEN ? AND ? GROUP BY date, meal').all(query.start, addDays(query.start, 6))) (demand[r.date] ||= {})[r.meal] = r.c;
   return {
-    students,
+    start: query.start, students, demand,
     totals: {
       students: students.length,
-      billed: students.reduce((s, x) => s + x.net, 0),
-      collected: students.reduce((s, x) => s + x.paid_amount, 0),
-      pending: students.reduce((s, x) => s + x.due, 0),
+      billed: students.reduce((t, x) => t + x.total, 0),
+      collected: students.reduce((t, x) => t + x.paid_amount, 0),
+      pending: students.reduce((t, x) => t + x.due, 0),
     },
   };
 });
 
 route('POST', '/api/staff/pay', 'staff', ({ body }) => {
-  if (!isMonth(body.month)) fail(400, 'month must be YYYY-MM');
+  if (!isWeekStart(body.start)) fail(400, 'start must be a Monday');
   const u = db.prepare("SELECT id FROM users WHERE id = ? AND role = 'student'").get(Number(body.user_id));
   if (!u) fail(404, 'Student not found');
-  return settle(u.id, body.month, 'Staff counter');
+  return settle(u.id, body.start, 'Cash (staff counter)');
 });
 
 // ---------- server ----------
